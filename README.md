@@ -1,60 +1,58 @@
 # awg-suite
 
-Репозиторий для воспроизводимой установки связки:
+Набор для установки связки:
 - AmneziaWG для OpenWrt
-- переключатель vpn-mode
-- локальная конфигурация `awg0` и `awg1` из нативных `*.conf` файлов AmneziaWG
+- domain-routing-openwrt
+- VPN mode switch
 
-## Как использовать
+## Запуск одной командой
 
-Положи в текущий каталог один или оба файла:
+Из каталога, где лежат конфиги `awg0.conf` и/или `awg1.conf`:
+
+```sh
+sh <(wget -O - https://raw.githubusercontent.com/Brilev/awg-suite/main/bootstrap.sh)
+```
+
+## Что должно лежать в текущем каталоге
+
+Скрипт ищет только эти файлы в **текущем каталоге**:
 - `./awg0.conf`
 - `./awg1.conf`
 
-Потом запускай bootstrap одной командой:
+Можно положить один файл или оба.
 
-```sh
-sh <(wget -O - https://raw.githubusercontent.com/Brilev/awg-suite/main/bootstrap.sh)
-```
+## Формат конфигов
 
-Bootstrap скачивает весь репозиторий во временный каталог и запускает локальный `install-all.sh`,
-но рабочим каталогом оставляет именно тот, из которого команда была вызвана.
+Используй **AmneziaWG native format (.conf)**, который экспортирует сама Amnezia.
 
-Поэтому входные файлы читаются **только из текущего каталога**.
-
-Если репозиторий нужно брать не из `Brilev/awg-suite` или не из ветки `main`, можно переопределить:
-
-```sh
-AWG_BOOTSTRAP_REPO='Brilev/awg-suite' AWG_BOOTSTRAP_REF='main' \
-sh <(wget -O - https://raw.githubusercontent.com/Brilev/awg-suite/main/bootstrap.sh)
-```
-
-## Формат входных файлов
-
-Используется родной экспорт AmneziaWG native format (`.conf`).
-Примеры:
+Примеры шаблонов:
 - `awg0.conf.example`
 - `awg1.conf.example`
 
+## Что делает bootstrap.sh
+
+- скачивает весь репозиторий `Brilev/awg-suite`
+- распаковывает его во временный каталог
+- запускает локальный `install-all.sh`
+- рабочим каталогом оставляет тот каталог, из которого был вызван bootstrap
+
 ## Что делает install-all.sh
 
-1. Запускает локальный snapshot `vendor/amneziawg-install.sh`
-2. Запускает локальный snapshot `vendor/vpn-mode-install.sh`
-3. Читает `./awg0.conf` и `./awg1.conf`
-4. Создаёт UCI-конфиг `network.awg0` / `network.awg1` и peer-секции
-5. Создаёт firewall zone/forwarding при отсутствии
-6. Делает один финальный apply в конце
+- запускает vendor-скрипты из `vendor/`
+- читает `./awg0.conf` и `./awg1.conf`
+- создаёт/обновляет `awg0` и `awg1` через UCI
+- в конце применяет изменения: `network reload`, `firewall restart`, `dnsmasq restart`
 
-## Обновление snapshot upstream
+## Проверка обновлений upstream
+
+Для сравнения snapshot в `vendor/` с upstream используй:
 
 ```sh
 sh tools/check-upstream.sh
-sh tools/summarize-diff.sh reports/<timestamp>
 ```
 
-## Важно
+После этого можно собрать краткую сводку:
 
-- `getdomains-install.sh` хранится в `vendor/` и участвует в diff-проверке, но автоматически не запускается.
-- Для полного сценария через архив/репозиторий рядом с `install-all.sh` должны лежать `vendor/`, `tools/` и остальные файлы.
-- Для one-liner запуска используй именно `bootstrap.sh`, а не прямой вызов `install-all.sh`.
-- `install-all.sh` рассчитан на запуск из уже скачанного репозитория, когда рядом есть `vendor/`.
+```sh
+sh tools/summarize-diff.sh reports/<timestamp>
+```

@@ -6,9 +6,18 @@ WORK_DIR="$(pwd)"
 AWG0_CONF="$WORK_DIR/awg0.conf"
 AWG1_CONF="$WORK_DIR/awg1.conf"
 
-log() { echo "[awg-bootstrap] $*"; }
-fail() { echo "[awg-bootstrap] ERROR: $*" >&2; exit 1; }
-need_cmd() { command -v "$1" >/dev/null 2>&1 || fail "command not found: $1"; }
+log() {
+  echo "[awg-bootstrap] $*"
+}
+
+fail() {
+  echo "[awg-bootstrap] ERROR: $*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || fail "command not found: $1"
+}
 
 need_cmd uci
 need_cmd awk
@@ -25,8 +34,13 @@ extract_conf_value() {
   section="$1"
   key="$2"
   file="$3"
+
   awk -F '=' -v want_section="$section" -v want_key="$key" '
-    function trim(s) { sub(/^[ \t\r\n]+/, "", s); sub(/[ \t\r\n]+$/, "", s); return s }
+    function trim(s) {
+      sub(/^[ \t\r\n]+/, "", s)
+      sub(/[ \t\r\n]+$/, "", s)
+      return s
+    }
     /^\[/ {
       current=trim($0)
       gsub(/^\[/, "", current)
@@ -37,14 +51,27 @@ extract_conf_value() {
       k=trim($1)
       v=substr($0, index($0, "=")+1)
       v=trim(v)
-      if (k == want_key) { print v; exit }
+      if (k == want_key) {
+        print v
+        exit
+      }
     }
   ' "$file"
 }
 
-split_endpoint_host() { echo "$1" | sed 's/:.*$//'; }
-split_endpoint_port() { echo "$1" | sed 's/^.*://'; }
-uci_set_if_present() { [ -n "$2" ] && uci set "$1=$2" || true; }
+split_endpoint_host() {
+  echo "$1" | sed 's/:.*$//'
+}
+
+split_endpoint_port() {
+  echo "$1" | sed 's/^.*://'
+}
+
+uci_set_if_present() {
+  option="$1"
+  value="$2"
+  [ -n "$value" ] && uci set "$option=$value" || true
+}
 
 run_vendor_installer() {
   name="$1"
@@ -56,13 +83,18 @@ run_vendor_installer() {
 }
 
 configure_iface_from_conf() {
-  iface="$1"; file="$2"; metric="$3"; table="$4"
+  iface="$1"
+  file="$2"
+  metric="$3"
+  table="$4"
+
   [ -f "$file" ] || return 0
 
   private_key="$(extract_conf_value Interface PrivateKey "$file")"
   address="$(extract_conf_value Interface Address "$file")"
   dns="$(extract_conf_value Interface DNS "$file")"
   mtu="$(extract_conf_value Interface MTU "$file")"
+
   public_key="$(extract_conf_value Peer PublicKey "$file")"
   preshared_key="$(extract_conf_value Peer PresharedKey "$file")"
   allowed_ips="$(extract_conf_value Peer AllowedIPs "$file")"
@@ -84,13 +116,17 @@ configure_iface_from_conf() {
   i3="$(extract_conf_value Peer I3 "$file")"
   i4="$(extract_conf_value Peer I4 "$file")"
   i5="$(extract_conf_value Peer I5 "$file")"
-  endpoint_host=""; endpoint_port=""
+
+  endpoint_host=""
+  endpoint_port=""
   [ -n "$endpoint" ] && endpoint_host="$(split_endpoint_host "$endpoint")"
   [ -n "$endpoint" ] && endpoint_port="$(split_endpoint_port "$endpoint")"
 
   log "configuring $iface from $(basename "$file")"
+
   uci -q delete "network.$iface"
   uci -q delete "network.${iface}_peer"
+
   uci set "network.$iface=interface"
   uci set "network.$iface.proto=amneziawg"
   uci_set_if_present "network.$iface.private_key" "$private_key"
@@ -98,7 +134,10 @@ configure_iface_from_conf() {
   uci_set_if_present "network.$iface.dns" "$dns"
   uci_set_if_present "network.$iface.mtu" "$mtu"
   uci_set_if_present "network.$iface.metric" "$metric"
-  [ "$iface" = "awg0" ] && uci_set_if_present "network.$iface.ip4table" "$table"
+
+  if [ "$iface" = "awg0" ]; then
+    uci_set_if_present "network.$iface.ip4table" "$table"
+  fi
 
   uci set "network.${iface}_peer=amneziawg_${iface}"
   uci set "network.${iface}_peer.public_key=${public_key}"
@@ -147,6 +186,7 @@ final_apply() {
   uci commit network
   uci commit firewall
   uci commit dhcp || true
+
   log "final apply"
   /etc/init.d/network reload || /etc/init.d/network restart || true
   /etc/init.d/firewall restart || true
@@ -158,10 +198,13 @@ final_apply() {
 
 main() {
   require_input
+
   run_vendor_installer amneziawg-install.sh
   run_vendor_installer vpn-mode-install.sh
+
   configure_iface_from_conf awg0 "$AWG0_CONF" 10 vpn
   configure_iface_from_conf awg1 "$AWG1_CONF" 20 main
+
   final_apply
   log "done"
 }

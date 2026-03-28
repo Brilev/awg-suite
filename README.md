@@ -1,4 +1,4 @@
-# awg-bootstrap
+# awg-suite
 
 Репозиторий для воспроизводимой установки связки:
 - AmneziaWG для OpenWrt
@@ -14,23 +14,24 @@
 Потом запускай bootstrap одной командой:
 
 ```sh
-sh <(wget -O - https://raw.githubusercontent.com/Brilev/<repo>/main/bootstrap.sh)
+sh <(wget -O - https://raw.githubusercontent.com/Brilev/awg-suite/main/bootstrap.sh)
 ```
 
 Bootstrap скачивает весь репозиторий во временный каталог и запускает локальный `install-all.sh`,
 но рабочим каталогом оставляет именно тот, из которого команда была вызвана.
+
 Поэтому входные файлы читаются **только из текущего каталога**.
 
-Если репозиторий нужно брать не из `Brilev/awg-bootstrap` или не из ветки `main`, можно переопределить:
+Если репозиторий нужно брать не из `Brilev/awg-suite` или не из ветки `main`, можно переопределить:
 
 ```sh
-AWG_BOOTSTRAP_REPO='Brilev/<repo>' AWG_BOOTSTRAP_REF='main' sh <(wget -O - https://raw.githubusercontent.com/Brilev/<repo>/main/bootstrap.sh)
+AWG_BOOTSTRAP_REPO='Brilev/awg-suite' AWG_BOOTSTRAP_REF='main' \
+sh <(wget -O - https://raw.githubusercontent.com/Brilev/awg-suite/main/bootstrap.sh)
 ```
 
 ## Формат входных файлов
 
 Используется родной экспорт AmneziaWG native format (`.conf`).
-
 Примеры:
 - `awg0.conf.example`
 - `awg1.conf.example`

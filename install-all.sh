@@ -27,7 +27,6 @@ log() {
 }
 
 need_cmd uci
-need_cmd awk
 need_cmd sed
 need_cmd grep
 need_cmd cut
@@ -42,39 +41,124 @@ if [ ! -f "$AWG0_CONF" ] && [ ! -f "$AWG1_CONF" ]; then
   exit 1
 fi
 
+is_known_key() {
+  case "$1" in
+    PrivateKey|Address|DNS|PublicKey|PresharedKey|AllowedIPs|Endpoint|PersistentKeepalive|Jc|Jmin|Jmax|S1|S2|H1|H2|H3|H4|S3|S4|I1|I2|I3|I4|I5)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+is_section_token() {
+  case "$1" in
+    "[Interface]"|"[Peer]")
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+trim_spaces() {
+  printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+append_value_token() {
+  current="$1"
+  token="$2"
+  if [ -z "$current" ]; then
+    printf '%s' "$token"
+  else
+    printf '%s %s' "$current" "$token"
+  fi
+}
+
 parse_conf_value() {
   file="$1"
   section="$2"
   key="$3"
 
-  awk -v target_section="$section" -v target_key="$key" '
-    function trim(s) {
-      sub(/^[ \t\r\n]+/, "", s)
-      sub(/[ \t\r\n]+$/, "", s)
-      return s
-    }
+  content="$(tr '\r\n' '  ' < "$file")"
+  set -- $content
+  current_section=""
 
-    /^\[/ {
-      current=$0
-      gsub(/^\[/, "", current)
-      gsub(/\]$/, "", current)
-      current=trim(current)
-      next
-    }
+  while [ "$#" -gt 0 ]; do
+    tok="$1"
+    shift
 
-    current == target_section {
-      line=$0
-      pos=index(line, "=")
-      if (pos > 0) {
-        k=trim(substr(line, 1, pos - 1))
-        v=trim(substr(line, pos + 1))
-        if (k == target_key) {
-          print v
-          exit
-        }
-      }
-    }
-  ' "$file"
+    case "$tok" in
+      "[Interface]"|"[Peer]")
+        current_section="${tok#[}"
+        current_section="${current_section%]}"
+        continue
+        ;;
+    esac
+
+    [ "$current_section" = "$section" ] || continue
+
+    if [ "$tok" = "$key" ] && [ "${1-}" = "=" ]; then
+      shift
+      value=""
+      while [ "$#" -gt 0 ]; do
+        if is_section_token "$1"; then
+          break
+        fi
+
+        if is_known_key "$1" && [ "${2-}" = "=" ]; then
+          break
+        fi
+
+        case "$1" in
+          *=*)
+            maybe_key="${1%%=*}"
+            if is_known_key "$maybe_key"; then
+              break
+            fi
+            ;;
+        esac
+
+        value="$(append_value_token "$value" "$1")"
+        shift
+      done
+      trim_spaces "$value"
+      return 0
+    fi
+
+    case "$tok" in
+      "$key"=*)
+        value="${tok#*=}"
+        while [ "$#" -gt 0 ]; do
+          if is_section_token "$1"; then
+            break
+          fi
+
+          if is_known_key "$1" && [ "${2-}" = "=" ]; then
+            break
+          fi
+
+          case "$1" in
+            *=*)
+              maybe_key="${1%%=*}"
+              if is_known_key "$maybe_key"; then
+                break
+              fi
+              ;;
+          esac
+
+          value="$(append_value_token "$value" "$1")"
+          shift
+        done
+        trim_spaces "$value"
+        return 0
+        ;;
+    esac
+  done
+
+  return 0
 }
 
 split_endpoint_host() {
@@ -99,6 +183,22 @@ uci_set_opt() {
   value="$2"
   [ -n "$value" ] || return 0
   uci set "$key=$value"
+}
+
+uci_replace_list() {
+  key="$1"
+  value="$2"
+  [ -n "$value" ] || return 0
+  uci -q delete "$key" || true
+  OLD_IFS="$IFS"
+  IFS=','
+  set -- $value
+  IFS="$OLD_IFS"
+  for item in "$@"; do
+    item="$(trim_spaces "$item")"
+    [ -n "$item" ] || continue
+    uci add_list "$key=$item"
+  done
 }
 
 find_zone_sections_by_name() {
@@ -158,6 +258,14 @@ ensure_named_zone() {
   uci set "firewall.$section.family=ipv4"
 }
 
+create_peer_section() {
+  iface="$1"
+  section_name="${iface}_peer"
+
+  uci_delete_if_exists "network.$section_name"
+  uci set "network.$section_name=amneziawg_${iface}"
+}
+
 configure_awg_iface() {
   iface="$1"
   conf="$2"
@@ -202,30 +310,30 @@ configure_awg_iface() {
   uci set "network.$iface.proto=amneziawg"
 
   uci_set_opt "network.$iface.private_key" "$private_key"
-  uci_set_opt "network.$iface.addresses" "$address"
-  uci_set_opt "network.$iface.dns" "$dns"
+  uci_replace_list "network.$iface.addresses" "$address"
+  uci_replace_list "network.$iface.dns" "$dns"
 
-  uci_set_opt "network.$iface.awg_jc" "$jc"
-  uci_set_opt "network.$iface.awg_jmin" "$jmin"
-  uci_set_opt "network.$iface.awg_jmax" "$jmax"
-  uci_set_opt "network.$iface.awg_s1" "$s1"
-  uci_set_opt "network.$iface.awg_s2" "$s2"
-  uci_set_opt "network.$iface.awg_h1" "$h1"
-  uci_set_opt "network.$iface.awg_h2" "$h2"
-  uci_set_opt "network.$iface.awg_h3" "$h3"
-  uci_set_opt "network.$iface.awg_h4" "$h4"
-  uci_set_opt "network.$iface.awg_s3" "$s3"
-  uci_set_opt "network.$iface.awg_s4" "$s4"
-  uci_set_opt "network.$iface.awg_i1" "$i1"
-  uci_set_opt "network.$iface.awg_i2" "$i2"
-  uci_set_opt "network.$iface.awg_i3" "$i3"
-  uci_set_opt "network.$iface.awg_i4" "$i4"
-  uci_set_opt "network.$iface.awg_i5" "$i5"
+  uci_set_opt "network.$iface.jc" "$jc"
+  uci_set_opt "network.$iface.jmin" "$jmin"
+  uci_set_opt "network.$iface.jmax" "$jmax"
+  uci_set_opt "network.$iface.s1" "$s1"
+  uci_set_opt "network.$iface.s2" "$s2"
+  uci_set_opt "network.$iface.h1" "$h1"
+  uci_set_opt "network.$iface.h2" "$h2"
+  uci_set_opt "network.$iface.h3" "$h3"
+  uci_set_opt "network.$iface.h4" "$h4"
+  uci_set_opt "network.$iface.s3" "$s3"
+  uci_set_opt "network.$iface.s4" "$s4"
+  uci_set_opt "network.$iface.i1" "$i1"
+  uci_set_opt "network.$iface.i2" "$i2"
+  uci_set_opt "network.$iface.i3" "$i3"
+  uci_set_opt "network.$iface.i4" "$i4"
+  uci_set_opt "network.$iface.i5" "$i5"
 
-  uci set "network.${iface}_peer=amneziawg_${iface}"
+  create_peer_section "$iface"
   uci_set_opt "network.${iface}_peer.public_key" "$public_key"
   uci_set_opt "network.${iface}_peer.preshared_key" "$preshared_key"
-  uci_set_opt "network.${iface}_peer.allowed_ips" "$allowed_ips"
+  uci_replace_list "network.${iface}_peer.allowed_ips" "$allowed_ips"
   uci_set_opt "network.${iface}_peer.endpoint_host" "$endpoint_host"
   uci_set_opt "network.${iface}_peer.endpoint_port" "$endpoint_port"
   uci_set_opt "network.${iface}_peer.persistent_keepalive" "$keepalive"
@@ -242,8 +350,6 @@ run_vendor_installer() {
 
   case "$name" in
     amneziawg-install.sh)
-      # 1) Install Russian language pack? -> n
-      # 2) Do you want to configure the amneziawg interface? -> n
       printf 'n\nn\n' | sh "$file" || {
         echo "WARNING: vendor installer failed: $name" >&2
         return 1
@@ -263,23 +369,18 @@ run_vendor_installer() {
 log "Workdir: $WORKDIR"
 log "Repo dir: $REPO_DIR"
 
-# 1. Install AWG packages only, without interactive interface config
 run_vendor_installer "$VENDOR_DIR/amneziawg-install.sh" || true
 
-# 2. Create interfaces from awg0.conf / awg1.conf
 configure_awg_iface awg0 "$AWG0_CONF"
 configure_awg_iface awg1 "$AWG1_CONF"
 
-# 3. Commit network/firewall before vpn-mode installer
 log "Applying UCI changes"
 uci commit network
 uci commit firewall
 uci commit dhcp || true
 
-# 4. Run vpn-mode installer only after network.awg0 / network.awg1 exist
 run_vendor_installer "$VENDOR_DIR/vpn-mode-install.sh" || true
 
-# 5. Final commit after vendor scripts
 uci commit network
 uci commit firewall
 uci commit dhcp || true

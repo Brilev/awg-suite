@@ -7,6 +7,21 @@ VENDOR_DIR="$REPO_DIR/vendor"
 
 AWG0_CONF="$WORKDIR/awg0.conf"
 AWG1_CONF="$WORKDIR/awg1.conf"
+DEBUG_UCI="${DEBUG_UCI:-1}"
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "ERROR: required command not found: $1" >&2
+    exit 1
+  }
+}
+
+need_file() {
+  [ -f "$1" ] || {
+    echo "ERROR: required file not found: $1" >&2
+    exit 1
+  }
+}
 
 log() {
   echo "==> $*"
@@ -21,21 +36,13 @@ fail() {
   exit 1
 }
 
-need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"
-}
-
-need_file() {
-  [ -f "$1" ] || fail "required file not found: $1"
-}
-
 need_cmd uci
 need_cmd sed
 need_cmd grep
 need_cmd cut
 need_cmd tr
 need_cmd dirname
-need_cmd basename
+need_cmd mktemp
 
 need_file "$VENDOR_DIR/amneziawg-install.sh"
 need_file "$VENDOR_DIR/vpn-mode-install.sh"
@@ -47,106 +54,61 @@ fi
 trim() {
   val="$1"
   # shellcheck disable=SC2001
-  val="$(printf '%s' "$val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  val="$(printf '%s' "$val" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
   printf '%s' "$val"
 }
 
-normalize_conf() {
+flatten_conf() {
   file="$1"
-  content="$(tr '\r\n' '  ' < "$file")"
-  content="$(printf '%s' "$content" | sed 's/\[/\n[/g')"
-  content="$(printf '%s' "$content" | sed 's/[[:space:]][[:space:]]*/ /g')"
-  printf '%s\n' "$content"
+  tr '\r\n' '  ' < "$file" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//'
 }
 
-section_blob() {
-  file="$1"
+extract_section_blob() {
+  flat="$1"
   section="$2"
-  normalized="$(normalize_conf "$file")"
-  current=""
-  blob=""
-  while IFS= read -r line; do
-    line="$(trim "$line")"
-    [ -n "$line" ] || continue
-    case "$line" in
-      "[$section]"*)
-        current="$section"
-        line="${line#"[$section]"}"
-        line="$(trim "$line")"
-        [ -n "$line" ] && blob="$blob $line"
-        ;;
-      \[*\])
-        current=""
-        ;;
-      *)
-        [ "$current" = "$section" ] && blob="$blob $line"
-        ;;
-    esac
-  done <<EOFSEC
-$normalized
-EOFSEC
-  printf '%s' "$(trim "$blob")"
+  marker="[$section]"
+
+  case "$flat" in
+    *"$marker"*) ;;
+    *)
+      printf '%s' ""
+      return 0
+      ;;
+  esac
+
+  rest="${flat#*"$marker"}"
+  case "$rest" in
+    *"["*) rest="${rest%%\[*}" ;;
+  esac
+
+  trim "$rest"
 }
 
-extract_key_from_blob() {
+blob_to_lines() {
+  blob="$1"
+  printf '%s' "$blob" \
+    | sed -E 's/[[:space:]]+([A-Za-z][A-Za-z0-9]*)[[:space:]]*=[[:space:]]*/\
+\1=/g' \
+    | sed '1s/^[[:space:]]*//'
+}
+
+get_blob_value() {
   blob="$1"
   key="$2"
-  rest="$blob"
 
-  while [ -n "$rest" ]; do
-    case "$rest" in
-      "$key = "*)
-        value="${rest#"$key = "}"
-        next_cut="$value"
-        for marker in \
-          ' PrivateKey = ' ' Address = ' ' DNS = ' ' MTU = ' \
-          ' PublicKey = ' ' PresharedKey = ' ' AllowedIPs = ' ' Endpoint = ' \
-          ' PersistentKeepalive = ' ' Jc = ' ' Jmin = ' ' Jmax = ' \
-          ' S1 = ' ' S2 = ' ' H1 = ' ' H2 = ' ' H3 = ' ' H4 = ' \
-          ' S3 = ' ' S4 = ' ' I1 = ' ' I2 = ' ' I3 = ' ' I4 = ' ' I5 = '
-        do
-          case "$next_cut" in
-            *"$marker"*)
-              next_cut="${next_cut%%$marker*}"
-              ;;
-          esac
-        done
-        printf '%s' "$(trim "$next_cut")"
-        return 0
-        ;;
-      *" $key = "*)
-        rest="${rest#*" $key = "}"
-        rest="$key = $rest"
-        ;;
-      *)
-        break
-        ;;
-    esac
-  done
+  lines="$(blob_to_lines "$blob")"
+  line="$(printf '%s\n' "$lines" | grep -m1 "^${key}=" || true)"
+  [ -n "$line" ] || {
+    printf '%s' ""
+    return 0
+  }
 
-  return 1
+  printf '%s' "${line#*=}"
 }
 
-parse_conf_value() {
-  file="$1"
-  section="$2"
-  key="$3"
-  blob="$(section_blob "$file" "$section")"
-  [ -n "$blob" ] || return 0
-  extract_key_from_blob "$blob" "$key" || true
-}
-
-split_csv_to_list() {
+split_csv_to_lines() {
   value="$1"
   printf '%s' "$value" | tr ',' '\n' | while IFS= read -r item; do
-    item="$(trim "$item")"
-    [ -n "$item" ] && printf '%s\n' "$item"
-  done
-}
-
-split_space_or_csv_to_list() {
-  value="$1"
-  printf '%s' "$value" | tr ',' ' ' | tr ' ' '\n' | while IFS= read -r item; do
     item="$(trim "$item")"
     [ -n "$item" ] && printf '%s\n' "$item"
   done
@@ -170,41 +132,38 @@ uci_delete_if_exists() {
   fi
 }
 
-log_value() {
-  key="$1"
-  value="$2"
-  if [ -z "$value" ]; then
-    log "uci $key = <empty>"
-  else
-    log "uci $key = [$value]"
-  fi
-}
-
 uci_set_logged() {
   key="$1"
   value="$2"
-  log_value "$key" "$value"
-  if ! uci set "$key=$value"; then
-    warn "failed: uci set $key=[${value}]"
-    exit 1
+  log "uci set ${key} = [${value}]"
+  if ! uci set "${key}=${value}"; then
+    warn "failed: uci set ${key}=[${value}]"
+    return 1
   fi
 }
 
 uci_add_list_logged() {
   key="$1"
   value="$2"
-  log_value "$key (+list)" "$value"
-  if ! uci add_list "$key=$value"; then
-    warn "failed: uci add_list $key=[${value}]"
-    exit 1
+  log "uci add_list ${key} = [${value}]"
+  if ! uci add_list "${key}=${value}"; then
+    warn "failed: uci add_list ${key}=[${value}]"
+    return 1
   fi
+}
+
+uci_set_if_present() {
+  key="$1"
+  value="$2"
+  [ -n "$value" ] || return 0
+  uci_set_logged "$key" "$value"
 }
 
 find_zone_sections_by_name() {
   zone_name="$1"
   uci show firewall 2>/dev/null \
-    | sed -n "s/^firewall\.\([^.=]*\)=zone$/\1/p" \
-    | while IFS= read -r sec; do
+    | sed -n 's/^firewall\.\([^.=]*\)=zone$/\1/p' \
+    | while read -r sec; do
         [ -n "$sec" ] || continue
         name="$(uci -q get firewall."$sec".name || true)"
         [ "$name" = "$zone_name" ] && echo "$sec"
@@ -214,15 +173,15 @@ find_zone_sections_by_name() {
 find_zone_sections_by_network() {
   net="$1"
   uci show firewall 2>/dev/null \
-    | sed -n "s/^firewall\.\([^.=]*\)=zone$/\1/p" \
-    | while IFS= read -r sec; do
+    | sed -n 's/^firewall\.\([^.=]*\)=zone$/\1/p' \
+    | while read -r sec; do
         [ -n "$sec" ] || continue
         networks="$(uci -q get firewall."$sec".network || true)"
         for n in $networks; do
-          [ "$n" = "$net" ] && {
+          if [ "$n" = "$net" ]; then
             echo "$sec"
             break
-          }
+          fi
         done
       done
 }
@@ -235,7 +194,7 @@ remove_duplicate_zones() {
   for sec in $(find_zone_sections_by_name "$zone_name"; find_zone_sections_by_network "$net"); do
     [ -n "$sec" ] || continue
     [ "$sec" = "$keep_section" ] && continue
-    log "Removing duplicate firewall zone: $sec"
+    log "uci delete firewall.$sec (duplicate zone for $zone_name/$net)"
     uci -q delete "firewall.$sec" || true
   done
 }
@@ -258,110 +217,98 @@ ensure_named_zone() {
   uci_set_logged "firewall.$section.family" "ipv4"
 }
 
-create_peer_section() {
-  iface="$1"
-  peer_name="${iface}_peer"
-  existing_type="$(uci -q show network | sed -n "s/^network\.$peer_name=\(.*\)$/\1/p" | head -n1 || true)"
-
-  if [ -n "$existing_type" ]; then
-    log "Existing peer section network.$peer_name type=$existing_type"
-    uci -q delete "network.$peer_name"
-  fi
-
-  uci_set_logged "network.$peer_name" "amneziawg_${iface}"
-}
-
 configure_awg_iface() {
   iface="$1"
   conf="$2"
 
   [ -f "$conf" ] || return 0
 
-  private_key="$(parse_conf_value "$conf" Interface PrivateKey)"
-  address="$(parse_conf_value "$conf" Interface Address)"
-  dns="$(parse_conf_value "$conf" Interface DNS)"
-  mtu="$(parse_conf_value "$conf" Interface MTU)"
-  jc="$(parse_conf_value "$conf" Interface Jc)"
-  jmin="$(parse_conf_value "$conf" Interface Jmin)"
-  jmax="$(parse_conf_value "$conf" Interface Jmax)"
-  s1="$(parse_conf_value "$conf" Interface S1)"
-  s2="$(parse_conf_value "$conf" Interface S2)"
-  h1="$(parse_conf_value "$conf" Interface H1)"
-  h2="$(parse_conf_value "$conf" Interface H2)"
-  h3="$(parse_conf_value "$conf" Interface H3)"
-  h4="$(parse_conf_value "$conf" Interface H4)"
-  s3="$(parse_conf_value "$conf" Interface S3)"
-  s4="$(parse_conf_value "$conf" Interface S4)"
-  i1="$(parse_conf_value "$conf" Interface I1)"
-  i2="$(parse_conf_value "$conf" Interface I2)"
-  i3="$(parse_conf_value "$conf" Interface I3)"
-  i4="$(parse_conf_value "$conf" Interface I4)"
-  i5="$(parse_conf_value "$conf" Interface I5)"
+  flat="$(flatten_conf "$conf")"
+  interface_blob="$(extract_section_blob "$flat" "Interface")"
+  peer_blob="$(extract_section_blob "$flat" "Peer")"
 
-  public_key="$(parse_conf_value "$conf" Peer PublicKey)"
-  preshared_key="$(parse_conf_value "$conf" Peer PresharedKey)"
-  allowed_ips="$(parse_conf_value "$conf" Peer AllowedIPs)"
-  endpoint="$(parse_conf_value "$conf" Peer Endpoint)"
-  keepalive="$(parse_conf_value "$conf" Peer PersistentKeepalive)"
+  log "Configuring $iface from $(basename "$conf")"
+  log "Parsed Interface blob: [$interface_blob]"
+  log "Parsed Peer blob: [$peer_blob]"
+
+  private_key="$(get_blob_value "$interface_blob" "PrivateKey")"
+  address="$(get_blob_value "$interface_blob" "Address")"
+  dns="$(get_blob_value "$interface_blob" "DNS")"
+  jc="$(get_blob_value "$interface_blob" "Jc")"
+  jmin="$(get_blob_value "$interface_blob" "Jmin")"
+  jmax="$(get_blob_value "$interface_blob" "Jmax")"
+  s1="$(get_blob_value "$interface_blob" "S1")"
+  s2="$(get_blob_value "$interface_blob" "S2")"
+  s3="$(get_blob_value "$interface_blob" "S3")"
+  s4="$(get_blob_value "$interface_blob" "S4")"
+  h1="$(get_blob_value "$interface_blob" "H1")"
+  h2="$(get_blob_value "$interface_blob" "H2")"
+  h3="$(get_blob_value "$interface_blob" "H3")"
+  h4="$(get_blob_value "$interface_blob" "H4")"
+  i1="$(get_blob_value "$interface_blob" "I1")"
+  i2="$(get_blob_value "$interface_blob" "I2")"
+  i3="$(get_blob_value "$interface_blob" "I3")"
+  i4="$(get_blob_value "$interface_blob" "I4")"
+  i5="$(get_blob_value "$interface_blob" "I5")"
+
+  public_key="$(get_blob_value "$peer_blob" "PublicKey")"
+  preshared_key="$(get_blob_value "$peer_blob" "PresharedKey")"
+  allowed_ips="$(get_blob_value "$peer_blob" "AllowedIPs")"
+  endpoint="$(get_blob_value "$peer_blob" "Endpoint")"
+  keepalive="$(get_blob_value "$peer_blob" "PersistentKeepalive")"
 
   endpoint_host="$(split_endpoint_host "$endpoint")"
   endpoint_port="$(split_endpoint_port "$endpoint")"
-
-  log "Configuring $iface from $(basename "$conf")"
-  log "Parsed Interface blob: [$(section_blob "$conf" Interface)]"
-  log "Parsed Peer blob: [$(section_blob "$conf" Peer)]"
 
   uci_delete_if_exists "network.$iface"
   uci_delete_if_exists "network.${iface}_peer"
 
   uci_set_logged "network.$iface" "interface"
   uci_set_logged "network.$iface.proto" "amneziawg"
-
-  [ -n "$private_key" ] && uci_set_logged "network.$iface.private_key" "$private_key"
-  [ -n "$mtu" ] && uci_set_logged "network.$iface.mtu" "$mtu"
+  uci_set_if_present "network.$iface.private_key" "$private_key"
 
   if [ -n "$address" ]; then
-    for item in $(split_csv_to_list "$address"); do
-      uci_add_list_logged "network.$iface.addresses" "$item"
+    split_csv_to_lines "$address" | while IFS= read -r item; do
+      uci_add_list_logged "network.$iface.addresses" "$item" || exit 1
     done
   fi
 
   if [ -n "$dns" ]; then
-    for item in $(split_space_or_csv_to_list "$dns"); do
-      uci_add_list_logged "network.$iface.dns" "$item"
+    split_csv_to_lines "$dns" | while IFS= read -r item; do
+      uci_add_list_logged "network.$iface.dns" "$item" || exit 1
     done
   fi
 
-  [ -n "$jc" ] && uci_set_logged "network.$iface.jc" "$jc"
-  [ -n "$jmin" ] && uci_set_logged "network.$iface.jmin" "$jmin"
-  [ -n "$jmax" ] && uci_set_logged "network.$iface.jmax" "$jmax"
-  [ -n "$s1" ] && uci_set_logged "network.$iface.s1" "$s1"
-  [ -n "$s2" ] && uci_set_logged "network.$iface.s2" "$s2"
-  [ -n "$h1" ] && uci_set_logged "network.$iface.h1" "$h1"
-  [ -n "$h2" ] && uci_set_logged "network.$iface.h2" "$h2"
-  [ -n "$h3" ] && uci_set_logged "network.$iface.h3" "$h3"
-  [ -n "$h4" ] && uci_set_logged "network.$iface.h4" "$h4"
-  [ -n "$s3" ] && uci_set_logged "network.$iface.s3" "$s3"
-  [ -n "$s4" ] && uci_set_logged "network.$iface.s4" "$s4"
-  [ -n "$i1" ] && uci_set_logged "network.$iface.i1" "$i1"
-  [ -n "$i2" ] && uci_set_logged "network.$iface.i2" "$i2"
-  [ -n "$i3" ] && uci_set_logged "network.$iface.i3" "$i3"
-  [ -n "$i4" ] && uci_set_logged "network.$iface.i4" "$i4"
-  [ -n "$i5" ] && uci_set_logged "network.$iface.i5" "$i5"
+  uci_set_if_present "network.$iface.awg_jc" "$jc"
+  uci_set_if_present "network.$iface.awg_jmin" "$jmin"
+  uci_set_if_present "network.$iface.awg_jmax" "$jmax"
+  uci_set_if_present "network.$iface.awg_s1" "$s1"
+  uci_set_if_present "network.$iface.awg_s2" "$s2"
+  uci_set_if_present "network.$iface.awg_s3" "$s3"
+  uci_set_if_present "network.$iface.awg_s4" "$s4"
+  uci_set_if_present "network.$iface.awg_h1" "$h1"
+  uci_set_if_present "network.$iface.awg_h2" "$h2"
+  uci_set_if_present "network.$iface.awg_h3" "$h3"
+  uci_set_if_present "network.$iface.awg_h4" "$h4"
+  uci_set_if_present "network.$iface.awg_i1" "$i1"
+  uci_set_if_present "network.$iface.awg_i2" "$i2"
+  uci_set_if_present "network.$iface.awg_i3" "$i3"
+  uci_set_if_present "network.$iface.awg_i4" "$i4"
+  uci_set_if_present "network.$iface.awg_i5" "$i5"
 
-  create_peer_section "$iface"
-  [ -n "$public_key" ] && uci_set_logged "network.${iface}_peer.public_key" "$public_key"
-  [ -n "$preshared_key" ] && uci_set_logged "network.${iface}_peer.preshared_key" "$preshared_key"
+  uci_set_logged "network.${iface}_peer" "amneziawg_${iface}"
+  uci_set_if_present "network.${iface}_peer.public_key" "$public_key"
+  uci_set_if_present "network.${iface}_peer.preshared_key" "$preshared_key"
 
   if [ -n "$allowed_ips" ]; then
-    for item in $(split_csv_to_list "$allowed_ips"); do
-      uci_add_list_logged "network.${iface}_peer.allowed_ips" "$item"
+    split_csv_to_lines "$allowed_ips" | while IFS= read -r item; do
+      uci_add_list_logged "network.${iface}_peer.allowed_ips" "$item" || exit 1
     done
   fi
 
-  [ -n "$endpoint_host" ] && uci_set_logged "network.${iface}_peer.endpoint_host" "$endpoint_host"
-  [ -n "$endpoint_port" ] && uci_set_logged "network.${iface}_peer.endpoint_port" "$endpoint_port"
-  [ -n "$keepalive" ] && uci_set_logged "network.${iface}_peer.persistent_keepalive" "$keepalive"
+  uci_set_if_present "network.${iface}_peer.endpoint_host" "$endpoint_host"
+  uci_set_if_present "network.${iface}_peer.endpoint_port" "$endpoint_port"
+  uci_set_if_present "network.${iface}_peer.persistent_keepalive" "$keepalive"
 
   ensure_named_zone "$iface"
 }

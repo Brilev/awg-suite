@@ -22,6 +22,10 @@ need_file() {
   }
 }
 
+log() {
+  echo "==> $*"
+}
+
 need_cmd uci
 need_cmd awk
 need_cmd sed
@@ -29,6 +33,7 @@ need_cmd grep
 need_cmd cut
 need_cmd tr
 need_cmd dirname
+
 need_file "$VENDOR_DIR/amneziawg-install.sh"
 need_file "$VENDOR_DIR/vpn-mode-install.sh"
 
@@ -42,24 +47,27 @@ parse_conf_value() {
   section="$2"
   key="$3"
 
-  awk -F '=' -v target_section="$section" -v target_key="$key" '
+  awk -v target_section="$section" -v target_key="$key" '
     function trim(s) {
       sub(/^[ \t\r\n]+/, "", s)
       sub(/[ \t\r\n]+$/, "", s)
       return s
     }
+
     /^\[/ {
-      current=trim($0)
+      current=$0
       gsub(/^\[/, "", current)
       gsub(/\]$/, "", current)
+      current=trim(current)
       next
     }
+
     current == target_section {
       line=$0
       pos=index(line, "=")
       if (pos > 0) {
-        k=trim(substr(line, 1, pos-1))
-        v=trim(substr(line, pos+1))
+        k=trim(substr(line, 1, pos - 1))
+        v=trim(substr(line, pos + 1))
         if (k == target_key) {
           print v
           exit
@@ -86,6 +94,70 @@ uci_delete_if_exists() {
   fi
 }
 
+uci_set_opt() {
+  key="$1"
+  value="$2"
+  [ -n "$value" ] || return 0
+  uci set "$key=$value"
+}
+
+find_zone_sections_by_name() {
+  zone_name="$1"
+  uci show firewall 2>/dev/null \
+    | sed -n "s/^firewall\.\([^.=]*\)=zone$/\1/p" \
+    | while read -r sec; do
+        [ -n "$sec" ] || continue
+        name="$(uci -q get firewall."$sec".name || true)"
+        [ "$name" = "$zone_name" ] && echo "$sec"
+      done
+}
+
+find_zone_sections_by_network() {
+  net="$1"
+  uci show firewall 2>/dev/null \
+    | sed -n "s/^firewall\.\([^.=]*\)=zone$/\1/p" \
+    | while read -r sec; do
+        [ -n "$sec" ] || continue
+        networks="$(uci -q get firewall."$sec".network || true)"
+        for n in $networks; do
+          if [ "$n" = "$net" ]; then
+            echo "$sec"
+            break
+          fi
+        done
+      done
+}
+
+remove_duplicate_zones() {
+  keep_section="$1"
+  zone_name="$2"
+  net="$3"
+
+  for sec in $(find_zone_sections_by_name "$zone_name"; find_zone_sections_by_network "$net"); do
+    [ -n "$sec" ] || continue
+    [ "$sec" = "$keep_section" ] && continue
+    uci -q delete "firewall.$sec" || true
+  done
+}
+
+ensure_named_zone() {
+  iface="$1"
+  section="${iface}_zone"
+
+  remove_duplicate_zones "$section" "$iface" "$iface"
+
+  uci_delete_if_exists "firewall.$section"
+  uci set "firewall.$section=zone"
+  uci set "firewall.$section.name=$iface"
+  uci set "firewall.$section.network=$iface"
+  uci set "firewall.$section.input=REJECT"
+  uci set "firewall.$section.output=ACCEPT"
+  uci set "firewall.$section.forward=REJECT"
+  uci set "firewall.$section.masq=1"
+  uci set "firewall.$section.mtu_fix=1"
+  uci set "firewall.$section.family=ipv4"
+}
+
 configure_awg_iface() {
   iface="$1"
   conf="$2"
@@ -95,6 +167,22 @@ configure_awg_iface() {
   private_key="$(parse_conf_value "$conf" Interface PrivateKey)"
   address="$(parse_conf_value "$conf" Interface Address)"
   dns="$(parse_conf_value "$conf" Interface DNS)"
+  jc="$(parse_conf_value "$conf" Interface Jc)"
+  jmin="$(parse_conf_value "$conf" Interface Jmin)"
+  jmax="$(parse_conf_value "$conf" Interface Jmax)"
+  s1="$(parse_conf_value "$conf" Interface S1)"
+  s2="$(parse_conf_value "$conf" Interface S2)"
+  h1="$(parse_conf_value "$conf" Interface H1)"
+  h2="$(parse_conf_value "$conf" Interface H2)"
+  h3="$(parse_conf_value "$conf" Interface H3)"
+  h4="$(parse_conf_value "$conf" Interface H4)"
+  s3="$(parse_conf_value "$conf" Interface S3)"
+  s4="$(parse_conf_value "$conf" Interface S4)"
+  i1="$(parse_conf_value "$conf" Interface I1)"
+  i2="$(parse_conf_value "$conf" Interface I2)"
+  i3="$(parse_conf_value "$conf" Interface I3)"
+  i4="$(parse_conf_value "$conf" Interface I4)"
+  i5="$(parse_conf_value "$conf" Interface I5)"
 
   public_key="$(parse_conf_value "$conf" Peer PublicKey)"
   preshared_key="$(parse_conf_value "$conf" Peer PresharedKey)"
@@ -102,86 +190,96 @@ configure_awg_iface() {
   endpoint="$(parse_conf_value "$conf" Peer Endpoint)"
   keepalive="$(parse_conf_value "$conf" Peer PersistentKeepalive)"
 
-  jc="$(parse_conf_value "$conf" Peer Jc)"
-  jmin="$(parse_conf_value "$conf" Peer Jmin)"
-  jmax="$(parse_conf_value "$conf" Peer Jmax)"
-  s1="$(parse_conf_value "$conf" Peer S1)"
-  s2="$(parse_conf_value "$conf" Peer S2)"
-  h1="$(parse_conf_value "$conf" Peer H1)"
-  h2="$(parse_conf_value "$conf" Peer H2)"
-  h3="$(parse_conf_value "$conf" Peer H3)"
-  h4="$(parse_conf_value "$conf" Peer H4)"
-
   endpoint_host="$(split_endpoint_host "$endpoint")"
   endpoint_port="$(split_endpoint_port "$endpoint")"
 
-  echo "==> Configuring $iface from $(basename "$conf")"
+  log "Configuring $iface from $(basename "$conf")"
 
   uci_delete_if_exists "network.$iface"
   uci_delete_if_exists "network.${iface}_peer"
 
   uci set "network.$iface=interface"
   uci set "network.$iface.proto=amneziawg"
-  [ -n "$private_key" ] && uci set "network.$iface.private_key=$private_key"
-  [ -n "$address" ] && uci set "network.$iface.addresses=$address"
-  [ -n "$dns" ] && uci set "network.$iface.dns=$dns"
+
+  uci_set_opt "network.$iface.private_key" "$private_key"
+  uci_set_opt "network.$iface.addresses" "$address"
+  uci_set_opt "network.$iface.dns" "$dns"
+
+  uci_set_opt "network.$iface.awg_jc" "$jc"
+  uci_set_opt "network.$iface.awg_jmin" "$jmin"
+  uci_set_opt "network.$iface.awg_jmax" "$jmax"
+  uci_set_opt "network.$iface.awg_s1" "$s1"
+  uci_set_opt "network.$iface.awg_s2" "$s2"
+  uci_set_opt "network.$iface.awg_h1" "$h1"
+  uci_set_opt "network.$iface.awg_h2" "$h2"
+  uci_set_opt "network.$iface.awg_h3" "$h3"
+  uci_set_opt "network.$iface.awg_h4" "$h4"
+  uci_set_opt "network.$iface.awg_s3" "$s3"
+  uci_set_opt "network.$iface.awg_s4" "$s4"
+  uci_set_opt "network.$iface.awg_i1" "$i1"
+  uci_set_opt "network.$iface.awg_i2" "$i2"
+  uci_set_opt "network.$iface.awg_i3" "$i3"
+  uci_set_opt "network.$iface.awg_i4" "$i4"
+  uci_set_opt "network.$iface.awg_i5" "$i5"
 
   uci set "network.${iface}_peer=amneziawg_${iface}"
-  uci set "network.${iface}_peer.public_key=$public_key"
-  [ -n "$preshared_key" ] && uci set "network.${iface}_peer.preshared_key=$preshared_key"
-  [ -n "$allowed_ips" ] && uci set "network.${iface}_peer.allowed_ips=$allowed_ips"
-  [ -n "$endpoint_host" ] && uci set "network.${iface}_peer.endpoint_host=$endpoint_host"
-  [ -n "$endpoint_port" ] && uci set "network.${iface}_peer.endpoint_port=$endpoint_port"
-  [ -n "$keepalive" ] && uci set "network.${iface}_peer.persistent_keepalive=$keepalive"
+  uci_set_opt "network.${iface}_peer.public_key" "$public_key"
+  uci_set_opt "network.${iface}_peer.preshared_key" "$preshared_key"
+  uci_set_opt "network.${iface}_peer.allowed_ips" "$allowed_ips"
+  uci_set_opt "network.${iface}_peer.endpoint_host" "$endpoint_host"
+  uci_set_opt "network.${iface}_peer.endpoint_port" "$endpoint_port"
+  uci_set_opt "network.${iface}_peer.persistent_keepalive" "$keepalive"
 
-  [ -n "$jc" ] && uci set "network.${iface}.jc=$jc"
-  [ -n "$jmin" ] && uci set "network.${iface}.jmin=$jmin"
-  [ -n "$jmax" ] && uci set "network.${iface}.jmax=$jmax"
-  [ -n "$s1" ] && uci set "network.${iface}.s1=$s1"
-  [ -n "$s2" ] && uci set "network.${iface}.s2=$s2"
-  [ -n "$h1" ] && uci set "network.${iface}.h1=$h1"
-  [ -n "$h2" ] && uci set "network.${iface}.h2=$h2"
-  [ -n "$h3" ] && uci set "network.${iface}.h3=$h3"
-  [ -n "$h4" ] && uci set "network.${iface}.h4=$h4"
-
-  if ! uci -q get firewall.${iface}_zone >/dev/null 2>&1; then
-    uci add firewall zone >/dev/null
-    last_zone="$(uci show firewall | sed -n 's/^firewall\.\([^=]*\)=zone$/\1/p' | tail -n1)"
-    [ -n "$last_zone" ] && uci rename "firewall.$last_zone=${iface}_zone"
-  fi
-
-  uci set "firewall.${iface}_zone=zone"
-  uci set "firewall.${iface}_zone.name=$iface"
-  uci set "firewall.${iface}_zone.network=$iface"
-  uci set "firewall.${iface}_zone.input=REJECT"
-  uci set "firewall.${iface}_zone.output=ACCEPT"
-  uci set "firewall.${iface}_zone.forward=REJECT"
-  uci set "firewall.${iface}_zone.masq=1"
-  uci set "firewall.${iface}_zone.mtu_fix=1"
+  ensure_named_zone "$iface"
 }
 
 run_vendor_installer() {
   file="$1"
   name="$(basename "$file")"
-  echo "==> Running vendor installer: $name"
+
+  log "Running vendor installer: $name"
   chmod +x "$file"
-  sh "$file" || {
-    echo "WARNING: vendor installer failed: $name" >&2
-    return 1
-  }
+
+  case "$name" in
+    amneziawg-install.sh)
+      # 1) Install Russian language pack? -> n
+      # 2) Do you want to configure the amneziawg interface? -> n
+      printf 'n\nn\n' | sh "$file" || {
+        echo "WARNING: vendor installer failed: $name" >&2
+        return 1
+      }
+      ;;
+    *)
+      sh "$file" || {
+        echo "WARNING: vendor installer failed: $name" >&2
+        return 1
+      }
+      ;;
+  esac
+
   return 0
 }
 
-echo "==> Workdir: $WORKDIR"
-echo "==> Repo dir: $REPO_DIR"
+log "Workdir: $WORKDIR"
+log "Repo dir: $REPO_DIR"
 
+# 1. Install AWG packages only, without interactive interface config
 run_vendor_installer "$VENDOR_DIR/amneziawg-install.sh" || true
-run_vendor_installer "$VENDOR_DIR/vpn-mode-install.sh" || true
 
+# 2. Create interfaces from awg0.conf / awg1.conf
 configure_awg_iface awg0 "$AWG0_CONF"
 configure_awg_iface awg1 "$AWG1_CONF"
 
-echo "==> Applying UCI changes"
+# 3. Commit network/firewall before vpn-mode installer
+log "Applying UCI changes"
+uci commit network
+uci commit firewall
+uci commit dhcp || true
+
+# 4. Run vpn-mode installer only after network.awg0 / network.awg1 exist
+run_vendor_installer "$VENDOR_DIR/vpn-mode-install.sh" || true
+
+# 5. Final commit after vendor scripts
 uci commit network
 uci commit firewall
 uci commit dhcp || true
@@ -198,4 +296,4 @@ if [ -x /usr/bin/vpn-mode-apply ]; then
   /usr/bin/vpn-mode-apply || true
 fi
 
-echo "==> Done"
+log "Done"

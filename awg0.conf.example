@@ -1,20 +1,27 @@
 [Interface]
-PrivateKey =
-Address = 10.8.1.2/24
-DNS = 1.1.1.1
+Address = 192.168.1.1/32
+DNS = 1.1.1.1, 1.0.0.1
+PrivateKey = lkahsdkljhakgfgagh28398y872ghuod2h98098oihIH9898=Example
+Jc = 1212123
+Jmin = 1231231
+Jmax = 12313
+S1 = 123123
+S2 = 123123
+S3 = 132
+S4 = 123
+H1 = 12313-23123123
+H2 = 12313-23123123
+H3 = 12313-23123123
+H4 = 12313-23123123
+I1 = lahlhpyp198y890y109e9058000010001000000000669636c6f756403636f6d0000010001c00c000100010000105a00044d583737>
+I2 = 
+I3 = 
+I4 = 
+I5 = 
 
 [Peer]
-PublicKey =
-PresharedKey =
-AllowedIPs = 0.0.0.0/0
-Endpoint = 203.0.113.10:51820
+PublicKey = lkahsdkljhakgfgagh28398y872ghuod2h98098oihIH9898=Example
+PresharedKey = lkahsdkljhakgfgagh28398y872ghuod2h98098oihIH9898=Example
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = 123.123.123.0:54367
 PersistentKeepalive = 25
-Jc = 3
-Jmin = 40
-Jmax = 70
-S1 = 0
-S2 = 0
-H1 = 1
-H2 = 2
-H3 = 3
-H4 = 4
